@@ -1,0 +1,15 @@
+---
+global:
+  scrape_interval: 5s # Set the scrape interval to every 15 seconds. Default is every 1 minute.
+  evaluation_interval: 5s # Evaluate rules every 15 seconds. The default is every 1 minute.
+
+alerting:
+
+rule_files:
+  
+scrape_configs:
+  - job_name: intro
+    static_configs:
+    - targets: ["intro:8081"]
+
+    

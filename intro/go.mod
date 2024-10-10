@@ -1,4 +1,4 @@
-module github.com/pienaahj/prometheus-grafana-intro
+module github.com/pienaahj/prometheus-grafana-intro/intro
 
 go 1.23.2
 
