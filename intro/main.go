@@ -5,8 +5,11 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	"encoding/json"
+
+	"math/rand"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
@@ -21,8 +24,10 @@ type Device struct {
 type metrics struct {
 	devices prometheus.Gauge
 	// add any metadata you want to add to the metrics here in key, value pairs
-	info     *prometheus.GaugeVec
-	upgrades *prometheus.GaugeVec
+	info          *prometheus.GaugeVec
+	upgrades      *prometheus.CounterVec
+	duration      *prometheus.HistogramVec
+	loginDuration prometheus.Summary
 }
 
 func NewMetrics(req prometheus.Registerer) *metrics {
@@ -37,14 +42,31 @@ func NewMetrics(req prometheus.Registerer) *metrics {
 			Name:      "info",
 			Help:      "Information about the Intro App environment.",
 		}, []string{"version"}),
-		upgrades: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		upgrades: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Namespace: "intro",
 			Name:      "device_upgrade_total",
 			Help:      "Number of upgrade devices.",
 		}, []string{"type"}),
+		duration: prometheus.NewHistogramVec(prometheus.HistogramOpts{
+			Namespace: "intro",
+			Name:      "request_duration_seconds", // note: you should use seconds
+			Help:      "Duration of the request.",
+			// 4 time larger for apdex score
+			// Buckets: prometheus.ExponentialBuckets(0.1, 1.5, 5),
+			// Buckets: prometheus.LinearBuckets(0.1, 0.1, 5),
+			// generate buckets for 0.1, 0.15, 0.2, 0.25, 0.3 these are in seconds
+			// these are used to count requests duration that fall into each bucket
+			Buckets: []float64{0.1, 0.15, 0.2, 0.25, 0.3}, // these buckets can be a challenge to set correctly
+		}, []string{"status", "method"}),
+		loginDuration: prometheus.NewSummary(prometheus.SummaryOpts{
+			Namespace:  "intro",
+			Name:       "login_request_duration_seconds", // note: you should use seconds
+			Help:       "Duration of the login request.",
+			Objectives: map[float64]float64{0.5: 0.05, 0.9: 0.01, 0.99: 0.001},
+		}), // these are used to calculate the apdex score
 	}
-	req.MustRegister(m.devices, m.info, m.upgrades) // register the metrics with the registry
-	return m                                        // return a pointer to the metrics object
+	req.MustRegister(m.devices, m.info, m.upgrades, m.duration, m.loginDuration) // register the metrics with the registry
+	return m                                                                     // return a pointer to the metrics object
 }
 
 var dvs []Device
@@ -70,7 +92,15 @@ func main() {
 	// the devices server will be used to expose the devices to the outside world
 	dMux := http.NewServeMux()
 	rdh := registerDevicesHandler{metrics: m}
+	mdh := manageDevicesHandler{metrics: m}
+
+	lh := loginHandler{}
+	mlh := middleware(lh, m)
+
 	dMux.Handle("/devices", rdh)
+	dMux.Handle("/devices/", mdh)
+	// this is a middleware that will be used to log the request
+	dMux.Handle("/login", mlh)
 
 	pMux := http.NewServeMux()
 	// promHandler := promhttp.HandlerFor(reg, promhttp.HandlerOpts{Registry: reg}) // custom prometheus handler
@@ -98,7 +128,7 @@ type registerDevicesHandler struct {
 func (rdh registerDevicesHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case "GET":
-		getDevices(w, r)
+		getDevices(w, r, rdh.metrics)
 	case "POST":
 		createDevice(w, r, rdh.metrics)
 	default:
@@ -108,12 +138,20 @@ func (rdh registerDevicesHandler) ServeHTTP(w http.ResponseWriter, r *http.Reque
 	}
 }
 
-func getDevices(w http.ResponseWriter, r *http.Request) {
+func getDevices(w http.ResponseWriter, r *http.Request, m *metrics) {
+	// get the current time
+	now := time.Now()
+
 	b, err := json.Marshal(dvs)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
+	// sleep for 200 milliseconds to simulate latency
+	sleep(200)
+
+	m.duration.With(prometheus.Labels{"status": "200", "method": "GET"}).Observe(time.Since(now).Seconds())
+
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	w.Write(b)
@@ -153,7 +191,49 @@ func upgradeDevice(w http.ResponseWriter, r *http.Request, m *metrics) {
 			dvs[i].Firmware = dv.Firmware
 		}
 	}
+	sleep(1000)
+
 	m.upgrades.With(prometheus.Labels{"type": "router"}).Inc()
 	w.WriteHeader(http.StatusAccepted)
 	w.Write([]byte("Upgrading..."))
+}
+
+type manageDevicesHandler struct {
+	metrics *metrics
+}
+
+func (mdh manageDevicesHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case "PUT":
+		upgradeDevice(w, r, mdh.metrics)
+	default:
+		w.Header().Set("Allow", "PUT")
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+}
+
+func sleep(ms int) {
+	// rand.Seed(time.Now().UnixNano())
+	r := rand.New(rand.NewSource(time.Now().UnixNano()))
+	now := time.Now()
+	n := r.Intn(ms + now.Second())
+	time.Sleep(time.Duration(n) * time.Millisecond)
+}
+
+type loginHandler struct{}
+
+func (l loginHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	sleep(200)
+	w.Write([]byte("Welcome to the Intro App!"))
+}
+
+// middelware to log the request
+func middleware(next http.Handler, m *metrics) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		now := time.Now()
+		next.ServeHTTP(w, r)
+		m.loginDuration.Observe(time.Since(now).Seconds())
+		log.Printf("Request %s %s %s %s", r.Method, r.URL.Path, r.RemoteAddr, time.Since(now))
+	})
 }
